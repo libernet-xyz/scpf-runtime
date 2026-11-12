@@ -2,4 +2,22 @@ syntax = "proto3";
 
 package starkom.scpf.v1;
 
-// TODO
+import "google/protobuf/descriptor.proto";
+
+// Annotations that tell the SCPF compiler how a protobuf message maps to an SCPF message.
+//
+// By default every protobuf field is linked to the SCPF field with the same name. The following
+// options override that default.
+extend google.protobuf.FieldOptions {
+  // If true, the field is not part of the SCPF serialization: the SCPF decoder doesn't produce it
+  // (it's provided externally to the decoder instead) and the SCPF encoder doesn't write it.
+  //
+  // This is meant for fields that the smartcontract has no use for, e.g. the hash backend.
+  bool skip = 57141;
+
+  // The name of the SCPF field that this field is linked to, if different from the name of the
+  // protobuf field.
+  //
+  // It's an error to set this on a field that is also `skip`.
+  string name = 57142;
+}
