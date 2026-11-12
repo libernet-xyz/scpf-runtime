@@ -9,8 +9,9 @@
 //! Field elements are inline words: the big-endian representation of their canonical integer form,
 //! in exactly [`Field::LEN`] bytes.
 //!
-//! Encoders append to a byte vector. Decoders read from the beginning of a byte slice and advance
-//! it past what they read, leaving it unchanged if they fail.
+//! Encoders append to a byte vector. Decoders read from the beginning of a byte slice and return
+//! the decoded value together with the number of bytes it takes up, so that the caller can advance
+//! past it.
 
 use anyhow::{Context, Result};
 use starkom_ff::Field;
@@ -20,34 +21,30 @@ pub fn encode_usize(value: usize, bytes: &mut Vec<u8>) {
     encode_u64(value as u64, bytes);
 }
 
-/// Decodes the varint at the beginning of `bytes`.
+/// Decodes the varint at the beginning of `bytes`, returning its value and its length in bytes.
 ///
 /// Returns an error if `bytes` is truncated or if the value doesn't fit in a `usize`, which can
 /// only happen on targets with pointers of less than 64 bits.
-pub fn decode_usize(bytes: &mut &[u8]) -> Result<usize> {
-    let mut input = *bytes;
-    let value = decode_u64(&mut input)?;
+pub fn decode_usize(bytes: &[u8]) -> Result<(usize, usize)> {
+    let (value, length) = decode_u64(bytes)?;
     let value = usize::try_from(value).context("varint overflow")?;
-    *bytes = input;
-    Ok(value)
+    Ok((value, length))
 }
 
 /// Appends `value` to `bytes` as an inline word.
-pub fn encode_field<F: Field>(value: F, bytes: &mut Vec<u8>) {
+pub fn encode_field_element<F: Field>(value: F, bytes: &mut Vec<u8>) {
     let word = value.to_u512().to_big_endian();
     bytes.extend_from_slice(&word[(word.len() - F::LEN)..]);
 }
 
-/// Decodes the inline word at the beginning of `bytes` as a field element.
+/// Decodes the inline word at the beginning of `bytes` as a field element, returning it together
+/// with the length of the word in bytes, which is always [`Field::LEN`].
 ///
 /// Returns an error if `bytes` is truncated or if the word isn't a canonical field element.
-pub fn decode_field<F: Field>(bytes: &mut &[u8]) -> Result<F> {
-    let (word, rest) = bytes
-        .split_at_checked(F::LEN)
-        .context("truncated field element")?;
+pub fn decode_field_element<F: Field>(bytes: &[u8]) -> Result<(F, usize)> {
+    let word = bytes.get(..F::LEN).context("truncated field element")?;
     let value = Option::from(F::try_from_be_bytes(word)).context("non-canonical field element")?;
-    *bytes = rest;
-    Ok(value)
+    Ok((value, F::LEN))
 }
 
 fn encode_u64(value: u64, bytes: &mut Vec<u8>) {
@@ -63,16 +60,15 @@ fn encode_u64(value: u64, bytes: &mut Vec<u8>) {
     }
 }
 
-fn decode_u64(bytes: &mut &[u8]) -> Result<u64> {
+fn decode_u64(bytes: &[u8]) -> Result<(u64, usize)> {
     let first = *bytes.first().context("truncated varint")?;
     let length = first.leading_ones() as usize + 1;
-    let (varint, rest) = bytes.split_at_checked(length).context("truncated varint")?;
+    let varint = bytes.get(..length).context("truncated varint")?;
     let mut value = u64::from(first) & (0x7f >> (length - 1));
     for &byte in &varint[1..] {
         value = (value << 8) | u64::from(byte);
     }
-    *bytes = rest;
-    Ok(value)
+    Ok((value, length))
 }
 
 #[cfg(test)]
@@ -119,11 +115,10 @@ mod tests {
     }
 
     fn test_decode_usize_impl(encoding: &[u8], expected: usize) {
-        let input = [encoding, &[0x42]].concat();
-        let mut bytes = input.as_slice();
-        let value = decode_usize(&mut bytes).unwrap();
+        let bytes = [encoding, &[0x42]].concat();
+        let (value, length) = decode_usize(&bytes).unwrap();
         assert_eq!(value, expected);
-        assert_eq!(bytes, [0x42]);
+        assert_eq!(length, encoding.len());
     }
 
     #[test]
@@ -166,27 +161,22 @@ mod tests {
 
     #[test]
     fn test_decode_consecutive_usizes() {
-        let input = [0x05, 0x81, 0x2c, 0x00];
-        let mut bytes = input.as_slice();
-        let first = decode_usize(&mut bytes).unwrap();
-        let second = decode_usize(&mut bytes).unwrap();
-        let third = decode_usize(&mut bytes).unwrap();
-        assert_eq!(first, 5);
-        assert_eq!(second, 300);
-        assert_eq!(third, 0);
-        assert!(bytes.is_empty());
+        let bytes = [0x05, 0x81, 0x2c, 0x00];
+        let (first, first_length) = decode_usize(&bytes).unwrap();
+        let (second, second_length) = decode_usize(&bytes[1..]).unwrap();
+        let (third, third_length) = decode_usize(&bytes[3..]).unwrap();
+        assert_eq!((first, first_length), (5, 1));
+        assert_eq!((second, second_length), (300, 2));
+        assert_eq!((third, third_length), (0, 1));
     }
 
     #[test]
     fn test_decode_usize_empty() {
-        let mut bytes: &[u8] = &[];
-        assert!(decode_usize(&mut bytes).is_err());
+        assert!(decode_usize(&[]).is_err());
     }
 
-    fn test_decode_usize_truncated_impl(input: &[u8]) {
-        let mut bytes = input;
-        assert!(decode_usize(&mut bytes).is_err());
-        assert_eq!(bytes, input);
+    fn test_decode_usize_truncated_impl(bytes: &[u8]) {
+        assert!(decode_usize(bytes).is_err());
     }
 
     #[test]
@@ -197,22 +187,22 @@ mod tests {
         test_decode_usize_truncated_impl(&[0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     }
 
-    fn test_encode_field_impl<F: Field>(value: F, expected: &[u8]) {
+    fn test_encode_field_element_impl<F: Field>(value: F, expected: &[u8]) {
         let mut bytes = vec![0x42];
-        encode_field(value, &mut bytes);
+        encode_field_element(value, &mut bytes);
         assert_eq!(bytes, [&[0x42], expected].concat());
     }
 
     #[test]
-    fn test_encode_field() {
-        test_encode_field_impl(KB::try_from(0u32).unwrap(), &[0x00, 0x00, 0x00, 0x00]);
-        test_encode_field_impl(
+    fn test_encode_field_element() {
+        test_encode_field_element_impl(KB::try_from(0u32).unwrap(), &[0x00, 0x00, 0x00, 0x00]);
+        test_encode_field_element_impl(
             KB::try_from(0x01020304u32).unwrap(),
             &[0x01, 0x02, 0x03, 0x04],
         );
-        test_encode_field_impl(KB::MAX, &[0x7f, 0x00, 0x00, 0x00]);
-        test_encode_field_impl(Scalar::from(0u64), &[0x00; 32]);
-        test_encode_field_impl(
+        test_encode_field_element_impl(KB::MAX, &[0x7f, 0x00, 0x00, 0x00]);
+        test_encode_field_element_impl(Scalar::from(0u64), &[0x00; 32]);
+        test_encode_field_element_impl(
             Scalar::from(0x0102u64),
             &[
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -220,7 +210,7 @@ mod tests {
                 0x00, 0x00, 0x01, 0x02,
             ],
         );
-        test_encode_field_impl(
+        test_encode_field_element_impl(
             Scalar::MAX,
             &[
                 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -228,8 +218,8 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00,
             ],
         );
-        test_encode_field_impl(KB8::from(0u32), &[0x00; 31]);
-        test_encode_field_impl(KB8::MAX, &KB8_MAX);
+        test_encode_field_element_impl(KB8::from(0u32), &[0x00; 31]);
+        test_encode_field_element_impl(KB8::MAX, &KB8_MAX);
     }
 
     /// The 31-byte encoding of the largest KoalaBear^8 element, `0x7f000001^8 - 1`.
@@ -239,24 +229,23 @@ mod tests {
         0x00,
     ];
 
-    fn test_decode_field_impl<F: Field>(encoding: &[u8], expected: F) {
-        let input = [encoding, &[0x42]].concat();
-        let mut bytes = input.as_slice();
-        let value = decode_field::<F>(&mut bytes).unwrap();
+    fn test_decode_field_element_impl<F: Field>(encoding: &[u8], expected: F) {
+        let bytes = [encoding, &[0x42]].concat();
+        let (value, length) = decode_field_element::<F>(&bytes).unwrap();
         assert_eq!(value, expected);
-        assert_eq!(bytes, [0x42]);
+        assert_eq!(length, encoding.len());
     }
 
     #[test]
-    fn test_decode_field() {
-        test_decode_field_impl(&[0x00, 0x00, 0x00, 0x00], KB::try_from(0u32).unwrap());
-        test_decode_field_impl(
+    fn test_decode_field_element() {
+        test_decode_field_element_impl(&[0x00, 0x00, 0x00, 0x00], KB::try_from(0u32).unwrap());
+        test_decode_field_element_impl(
             &[0x01, 0x02, 0x03, 0x04],
             KB::try_from(0x01020304u32).unwrap(),
         );
-        test_decode_field_impl(&[0x7f, 0x00, 0x00, 0x00], KB::MAX);
-        test_decode_field_impl(&[0x00; 32], Scalar::from(0u64));
-        test_decode_field_impl(
+        test_decode_field_element_impl(&[0x7f, 0x00, 0x00, 0x00], KB::MAX);
+        test_decode_field_element_impl(&[0x00; 32], Scalar::from(0u64));
+        test_decode_field_element_impl(
             &[
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -264,7 +253,7 @@ mod tests {
             ],
             Scalar::from(0x0102u64),
         );
-        test_decode_field_impl(
+        test_decode_field_element_impl(
             &[
                 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0xff, 0xfe, 0x06, 0x73, 0xdd, 0xf2, 0x9e, 0x9b, 0x55, 0x47, 0xc0, 0x00, 0x00, 0x00,
@@ -272,41 +261,39 @@ mod tests {
             ],
             Scalar::MAX,
         );
-        test_decode_field_impl(&[0x00; 31], KB8::from(0u32));
-        test_decode_field_impl(&KB8_MAX, KB8::MAX);
+        test_decode_field_element_impl(&[0x00; 31], KB8::from(0u32));
+        test_decode_field_element_impl(&KB8_MAX, KB8::MAX);
     }
 
-    fn test_decode_field_error_impl<F: Field>(input: &[u8]) {
-        let mut bytes = input;
-        assert!(decode_field::<F>(&mut bytes).is_err());
-        assert_eq!(bytes, input);
-    }
-
-    #[test]
-    fn test_decode_field_truncated() {
-        test_decode_field_error_impl::<KB>(&[]);
-        test_decode_field_error_impl::<KB>(&[0x01, 0x02, 0x03]);
-        test_decode_field_error_impl::<Scalar>(&[0x00; 31]);
-        test_decode_field_error_impl::<KB8>(&[0x00; 30]);
+    fn test_decode_field_element_error_impl<F: Field>(bytes: &[u8]) {
+        assert!(decode_field_element::<F>(bytes).is_err());
     }
 
     #[test]
-    fn test_decode_field_non_canonical() {
+    fn test_decode_field_element_truncated() {
+        test_decode_field_element_error_impl::<KB>(&[]);
+        test_decode_field_element_error_impl::<KB>(&[0x01, 0x02, 0x03]);
+        test_decode_field_element_error_impl::<Scalar>(&[0x00; 31]);
+        test_decode_field_element_error_impl::<KB8>(&[0x00; 30]);
+    }
+
+    #[test]
+    fn test_decode_field_element_non_canonical() {
         // The moduli.
-        test_decode_field_error_impl::<KB>(&[0x7f, 0x00, 0x00, 0x01]);
-        test_decode_field_error_impl::<Scalar>(&[
+        test_decode_field_element_error_impl::<KB>(&[0x7f, 0x00, 0x00, 0x01]);
+        test_decode_field_element_error_impl::<Scalar>(&[
             0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xfe, 0x06, 0x73, 0xdd, 0xf2, 0x9e, 0x9b, 0x55, 0x47, 0xc0, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x01,
         ]);
         // All ones.
-        test_decode_field_error_impl::<KB>(&[0xff; 4]);
-        test_decode_field_error_impl::<KB8>(&[0xff; 31]);
+        test_decode_field_element_error_impl::<KB>(&[0xff; 4]);
+        test_decode_field_element_error_impl::<KB8>(&[0xff; 31]);
     }
 
     #[test]
     #[ignore = "starkom-bluesky 3.8.0 panics on overflow in debug builds for some words above P"]
-    fn test_decode_field_non_canonical_bluesky_all_ones() {
-        test_decode_field_error_impl::<Scalar>(&[0xff; 32]);
+    fn test_decode_field_element_non_canonical_bluesky_all_ones() {
+        test_decode_field_element_error_impl::<Scalar>(&[0xff; 32]);
     }
 }
